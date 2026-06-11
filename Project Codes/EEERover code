@@ -61,13 +61,11 @@ volatile unsigned long pulseCount = 0;
 unsigned long irPulseRate = 0;
 unsigned long lastIRSampleTime = 0;
 
-void pulseISR()
-{
+void pulseISR() {
   pulseCount++;
 }
 
-void updateIRPulseRate()
-{
+void updateIRPulseRate() {
   if (millis() - lastIRSampleTime >= 1000)
   {
     noInterrupts();
@@ -86,8 +84,7 @@ const int ULTRASONIC_INPUT_PIN = A0;
 
 bool ultrasonicDetected = false;
 
-void updateUltrasonicSensor()
-{
+void updateUltrasonicSensor() {
   ultrasonicDetected = (digitalRead(ULTRASONIC_INPUT_PIN) == HIGH);
 }
 
