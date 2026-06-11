@@ -1,1 +1,983 @@
+/**************************************************************************************************************************************
+  EEERover Web Control 
 
+  MOTOR WIRING USED 
+
+   D2  -> LEFT DIR
+   D6  -> LEFT EN
+   D0  -> RIGHT DIR
+   D8  -> RIGHT EN
+
+   D1  -> Infrared sensor pulse input
+   A0  -> Ultrasonic 40kHz sensor digital output
+   D13 -> Radio sensor input
+
+   GND -> motor driver / EEEBug GND
+
+  WiFi:
+    SSID: EEERover
+    Password: exhibition
+    Group number: 8
+    Static IP: 192.168.0.9
+
+  Webpage displays:
+    - Rover controls
+    - Rover state
+    - Speed setting
+    - Magnetic field direction
+    - Current magnetic Z value
+    - Magnetic baseline value
+    - Magnetic calibrate button
+    - IR count rate
+    - Ultrasonic 40kHz detection
+    - Current radio age
+ ***************************************************************************************************************************************/
+
+#include <SPI.h>
+#include <Wire.h>
+#include <WiFi101.h>
+#include "DFRobot_BMM150.h"
+
+const char ssid[] = "EEERover";
+const char pass[] = "exhibition";
+
+// Group 8 gives IP address 192.168.0.9
+const int groupNumber = 8;
+
+WiFiServer server(80);
+
+// ---------------- MAGNETIC SENSOR ----------------
+
+DFRobot_BMM150_I2C bmm150(&Wire, I2C_ADDRESS_4);
+bool bmmReady = false;
+
+float magneticBaselineZ = 15.0;
+
+// ---------------- INFRARED SENSOR ----------------
+
+const int IR_INPUT_PIN = 1;
+
+volatile unsigned long pulseCount = 0;
+unsigned long irPulseRate = 0;
+unsigned long lastIRSampleTime = 0;
+
+void pulseISR()
+{
+  pulseCount++;
+}
+
+void updateIRPulseRate()
+{
+  if (millis() - lastIRSampleTime >= 1000)
+  {
+    noInterrupts();
+    unsigned long count = pulseCount;
+    pulseCount = 0;
+    interrupts();
+
+    irPulseRate = count;
+    lastIRSampleTime = millis();
+  }
+}
+
+// ---------------- ULTRASONIC SENSOR ----------------
+
+const int ULTRASONIC_INPUT_PIN = A0;
+
+bool ultrasonicDetected = false;
+
+void updateUltrasonicSensor()
+{
+  ultrasonicDetected = (digitalRead(ULTRASONIC_INPUT_PIN) == HIGH);
+}
+
+// ---------------- RADIO SENSOR ----------------
+
+const int RADIO_INPUT_PIN = 13;
+const unsigned int RADIO_BAUD_DELAY_US = 1667;
+const unsigned long RADIO_TIMEOUT_MS = 2000;
+
+String radioBuffer = "";
+String currentRadioAge = "NO READING";
+
+unsigned long lastRadioDataTime = 0;
+bool radioTimedOut = false;
+
+int readRadioByte() {
+  if (digitalRead(RADIO_INPUT_PIN) == HIGH) {
+    return -1;
+  }
+
+  delayMicroseconds(RADIO_BAUD_DELAY_US / 2);
+
+  if (digitalRead(RADIO_INPUT_PIN) == HIGH) {
+    return -1;
+  }
+
+  byte value = 0;
+
+  for (int bitIndex = 0; bitIndex < 8; bitIndex++) {
+    delayMicroseconds(RADIO_BAUD_DELAY_US);
+
+    if (digitalRead(RADIO_INPUT_PIN) == HIGH) {
+      value |= (1 << bitIndex);
+    }
+  }
+
+  delayMicroseconds(RADIO_BAUD_DELAY_US);
+
+  return value;
+}
+
+void processRadioChar(char data) {
+  lastRadioDataTime = millis();
+  radioTimedOut = false;
+
+  if (data == '#') {
+    if (radioBuffer.length() == 3) {
+      String newAge = "";
+      newAge += radioBuffer[0];
+      newAge += ".";
+      newAge += radioBuffer[1];
+      newAge += radioBuffer[2];
+      newAge += " billion years";
+
+      currentRadioAge = newAge;
+    }
+
+    radioBuffer = "";
+  }
+  else if (isDigit(data)) {
+    if (radioBuffer.length() < 3) {
+      radioBuffer += data;
+    }
+    else {
+      radioBuffer = "";
+      radioBuffer += data;
+    }
+  }
+}
+
+void updateRadioSensor() {
+  int incomingByte = readRadioByte();
+  if (incomingByte >= 0) {
+    processRadioChar((char)incomingByte);
+  }
+
+  if ((millis() - lastRadioDataTime > RADIO_TIMEOUT_MS) && !radioTimedOut) {
+    radioBuffer = "";
+    currentRadioAge = "NO READING";
+    radioTimedOut = true;
+  }
+}
+
+// ---------------- MOTOR PIN DEFINITIONS ----------------
+
+const int LEFT_DIR  = 2;
+const int LEFT_EN   = 6;
+const int RIGHT_DIR = 0;
+const int RIGHT_EN  = 8;
+
+// ---------------- SPEED SETTINGS ----------------
+
+const int TURN_HALF_SPEED = 128;
+
+int speedMode = 2;
+
+const unsigned long MOTOR_TIMEOUT_MS = 650;
+unsigned long lastMotorCommandTime = 0;
+bool motorsAreRunning = false;
+
+unsigned long latestCommandSeq = 0;
+
+// ---------------- DIRECTION SETTINGS ----------------
+
+const int RIGHT_FORWARD_DIR  = HIGH;
+const int RIGHT_BACKWARD_DIR = LOW;
+
+const int LEFT_FORWARD_DIR   = LOW;
+const int LEFT_BACKWARD_DIR  = HIGH;
+
+// ---------------- SPEED HELPER FUNCTIONS ----------------
+
+int getFullSpeed() {
+  if (speedMode == 0) {
+    return 128;
+  }
+  else if (speedMode == 1) {
+    return 192;
+  }
+
+  return 255;
+}
+
+int getHalfSpeed() {
+  if (speedMode == 0) {
+    return 64;
+  }
+  else if (speedMode == 1) {
+    return 96;
+  }
+
+  return 128;
+}
+
+// ---------------- COMMAND SEQUENCE HELPERS ----------------
+
+unsigned long getCommandSeq(String requestLine) {
+  int seqIndex = requestLine.indexOf("seq=");
+
+  if (seqIndex < 0) {
+    return latestCommandSeq + 1;
+  }
+
+  int startIndex = seqIndex + 4;
+  unsigned long seq = 0;
+
+  while (startIndex < requestLine.length()) {
+    char c = requestLine.charAt(startIndex);
+
+    if (c < '0' || c > '9') {
+      break;
+    }
+
+    seq = (seq * 10) + (c - '0');
+    startIndex++;
+  }
+
+  return seq;
+}
+
+bool acceptMovementCommand(String requestLine) {
+  unsigned long incomingSeq = getCommandSeq(requestLine);
+  if (incomingSeq < latestCommandSeq) {
+    return false;
+  }
+
+  latestCommandSeq = incomingSeq;
+  return true;
+}
+
+bool acceptKeepAlive(String requestLine) {
+  unsigned long incomingSeq = getCommandSeq(requestLine);
+  if (incomingSeq == latestCommandSeq && motorsAreRunning) {
+    return true;
+  }
+
+  return false;
+}
+
+// ---------------- MAGNETIC SENSOR HELPER ----------------
+
+sBmm150MagData_t getMagneticData() {
+  sBmm150MagData_t magData;
+  magData.x = 0;
+  magData.y = 0;
+  magData.z = 0;
+
+  if (bmmReady) {
+    magData = bmm150.getGeomagneticData();
+  }
+
+  return magData;
+}
+
+String getMagneticDirection(float zValue) {
+  if (!bmmReady) {
+    return "NO READING";
+  }
+
+  if (zValue > magneticBaselineZ + 15.0) {
+    return "UP";
+  }
+  else if (zValue < magneticBaselineZ - 15.0) {
+    return "DOWN";
+  }
+
+  return "NO READING";
+}
+
+void calibrateMagneticBaseline() {
+  if (bmmReady) {
+    sBmm150MagData_t magData = bmm150.getGeomagneticData();
+    magneticBaselineZ = magData.z;
+  }
+}
+
+// ---------------- MOTOR CONTROL FUNCTIONS ----------------
+
+void stopMotors() {
+  analogWrite(RIGHT_EN, 0);
+  analogWrite(LEFT_EN, 0);
+  motorsAreRunning = false;
+}
+
+void markMotorCommand() {
+  lastMotorCommandTime = millis();
+  motorsAreRunning = true;
+}
+
+void refreshMotorTimeout() {
+  if (motorsAreRunning) {
+    lastMotorCommandTime = millis();
+  }
+}
+
+void rightMotorForward(int speedValue) {
+  digitalWrite(RIGHT_DIR, RIGHT_FORWARD_DIR);
+  analogWrite(RIGHT_EN, speedValue);
+}
+
+void rightMotorBackward(int speedValue) {
+  digitalWrite(RIGHT_DIR, RIGHT_BACKWARD_DIR);
+  analogWrite(RIGHT_EN, speedValue);
+}
+
+void leftMotorForward(int speedValue) {
+  digitalWrite(LEFT_DIR, LEFT_FORWARD_DIR);
+  analogWrite(LEFT_EN, speedValue);
+}
+
+void leftMotorBackward(int speedValue) {
+  digitalWrite(LEFT_DIR, LEFT_BACKWARD_DIR);
+  analogWrite(LEFT_EN, speedValue);
+}
+
+// ---------------- MOVEMENT FUNCTIONS ----------------
+
+void driveForward() {
+  markMotorCommand();
+  leftMotorBackward(getFullSpeed());
+  rightMotorBackward(getFullSpeed());
+}
+
+void driveBackward() {
+  markMotorCommand();
+  leftMotorForward(getFullSpeed());
+  rightMotorForward(getFullSpeed());
+}
+
+void driveLeft() {
+  markMotorCommand();
+  leftMotorBackward(TURN_HALF_SPEED);
+  rightMotorForward(TURN_HALF_SPEED);
+}
+
+void driveRight() {
+  markMotorCommand();
+  leftMotorForward(TURN_HALF_SPEED);
+  rightMotorBackward(TURN_HALF_SPEED);
+}
+
+void driveForwardLeft() {
+  markMotorCommand();
+  leftMotorBackward(getHalfSpeed());
+  rightMotorBackward(getFullSpeed());
+}
+
+void driveForwardRight() {
+  markMotorCommand();
+  leftMotorBackward(getFullSpeed());
+  rightMotorBackward(getHalfSpeed());
+}
+
+void driveBackLeft() {
+  markMotorCommand();
+  leftMotorForward(getHalfSpeed());
+  rightMotorForward(getFullSpeed());
+}
+
+void driveBackRight() {
+  markMotorCommand();
+  leftMotorForward(getFullSpeed());
+  rightMotorForward(getHalfSpeed());
+}
+
+// ---------------- HTTP RESPONSE FUNCTIONS ----------------
+
+void sendText(WiFiClient &client, const char *text) {
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/plain; charset=utf-8"));
+  client.println(F("Cache-Control: no-store"));
+  client.println(F("Connection: close"));
+  client.println();
+  client.print(text);
+}
+
+void sendNotFound(WiFiClient &client) {
+  client.println(F("HTTP/1.1 404 Not Found"));
+  client.println(F("Content-Type: text/plain; charset=utf-8"));
+  client.println(F("Cache-Control: no-store"));
+  client.println(F("Connection: close"));
+  client.println();
+  client.print(F("404"));
+}
+
+void sendChunk(WiFiClient &client, const __FlashStringHelper *chunk) {
+  client.print(chunk);
+}
+
+// ---------------- WEBPAGE ----------------
+
+void sendWebpage(WiFiClient &client) {
+  client.println(F("HTTP/1.1 200 OK"));
+  client.println(F("Content-Type: text/html; charset=utf-8"));
+  client.println(F("Cache-Control: no-store"));
+  client.println(F("Connection: close"));
+  client.println();
+
+  sendChunk(client, F(
+"<!DOCTYPE html><html><head>"
+"<meta charset='utf-8'>"
+"<meta name='viewport' content='width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no'>"
+"<title>EEE Rover Control</title>"
+"<style>"
+"*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}"
+"html,body{margin:0;padding:0;min-height:100%;background:#020617;color:#f8fafc;font-family:Arial,Helvetica,sans-serif}"
+"body{display:flex;justify-content:center;align-items:center;padding:18px}"
+".card{width:min(96vw,1050px);background:#030712;border:1px solid #334155;border-radius:28px;padding:28px;box-shadow:0 24px 70px rgba(0,0,0,.5)}"
+"h1{margin:0 0 28px 0;text-align:center;font-size:42px;line-height:1.1}"
+".layout{display:grid;grid-template-columns:1.1fr .9fr;gap:22px;align-items:start}"
+".panel{background:#111827;border:1px solid #334155;border-radius:24px;padding:22px;text-align:center}"
+".panelTitle{display:block;font-size:26px;font-weight:900;margin-bottom:20px}"
+".state{background:#020617;border:1px solid #334155;border-radius:20px;padding:18px;margin-bottom:22px}"
+".label{display:block;color:#94a3b8;font-size:13px;letter-spacing:2px;text-transform:uppercase;margin-bottom:8px}"
+"#state,#speedStatus{display:block;color:#38bdf8;font-size:32px;font-weight:900}"
+  ));
+
+  sendChunk(client, F(
+".pad{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;margin:0 auto 22px auto;max-width:470px}"
+".btn{border:0;border-radius:18px;min-height:74px;font-size:20px;font-weight:900;color:white;background:#334155;box-shadow:0 10px 22px rgba(0,0,0,.3);cursor:pointer;user-select:none;touch-action:none}"
+".btn small{display:block;font-size:13px;font-weight:700;color:#dbeafe;margin-top:6px}"
+".btn:active,.btn.active{background:#0284c7;transform:translateY(2px) scale(.98)}"
+".forward{grid-column:2}.left{grid-column:1}.stop{grid-column:2;background:#b91c1c}.right{grid-column:3}.backward{grid-column:2}"
+".speedBox{background:#020617;border:1px solid #334155;border-radius:20px;padding:18px;margin-bottom:18px}"
+"input[type=range]{width:100%;accent-color:#38bdf8}"
+".speedLabels{display:flex;justify-content:space-between;color:#dbeafe;font-size:14px;font-weight:900;margin-top:10px}"
+".help{color:#dbeafe;font-size:15px;line-height:1.5}"
+".key{display:inline-block;background:#111827;border:1px solid #475569;border-radius:7px;padding:4px 9px;color:#e2e8f0;font-weight:800;margin:2px}"
+  ));
+
+  sendChunk(client, F(
+".inputGrid{display:grid;grid-template-columns:1fr;gap:14px}"
+".inputItem{background:#020617;border:1px solid #334155;border-radius:20px;padding:18px;text-align:center}"
+".inputName{display:block;color:#94a3b8;font-size:13px;font-weight:900;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px}"
+".inputValue{display:block;font-size:28px;font-weight:900;margin-top:6px;word-break:break-word}"
+".magValue{color:#4ade80}"
+".zValue{color:#38bdf8;font-size:21px}"
+".baseValue{color:#c084fc;font-size:21px}"
+".irValue{color:#facc15}"
+".ultraValue{color:#22d3ee}"
+".radioValue{color:#fb923c}"
+".calBtn{margin-top:12px;min-height:50px;background:#7c3aed;width:100%}"
+"@media(max-width:850px){body{align-items:flex-start}.layout{grid-template-columns:1fr}.card{width:96vw}h1{font-size:34px}}"
+"</style></head>"
+  ));
+
+  sendChunk(client, F(
+"<body><main class='card'>"
+"<h1>EEE Rover Control</h1>"
+"<div class='layout'>"
+
+"<section class='panel'>"
+"<span class='panelTitle'>Rover Controls</span>"
+"<div class='state'><span class='label'>Rover State</span><span id='state'>STOPPED</span></div>"
+
+"<section class='pad'>"
+"<button id='bf' class='btn forward'>Forward<small>Up</small></button>"
+"<button id='bl' class='btn left'>Left<small>Left</small></button>"
+"<button id='bs' class='btn stop'>Stop<small>Release</small></button>"
+"<button id='br' class='btn right'>Right<small>Right</small></button>"
+"<button id='bb' class='btn backward'>Back<small>Down</small></button>"
+"</section>"
+
+"<section class='speedBox'>"
+"<span class='label'>Speed Setting</span>"
+"<span id='speedStatus'>MAX</span>"
+"<input id='speedSlider' type='range' min='0' max='2' step='1' value='2'>"
+"<div class='speedLabels'><span>MIN</span><span>MID</span><span>MAX</span></div>"
+"</section>"
+
+"<div class='help'>Keyboard control:<br>"
+"<span class='key'>Up</span><span class='key'>Down</span><span class='key'>Left</span><span class='key'>Right</span><br>"
+"Hold two arrows together for curved movement."
+"</div>"
+"</section>"
+  ));
+
+  sendChunk(client, F(
+"<section class='panel'>"
+"<span class='panelTitle'>Sensor Readings</span>"
+"<div class='inputGrid'>"
+
+"<div class='inputItem'>"
+"<span class='inputName'>Magnetic Field</span>"
+"<span id='mag' class='inputValue magValue'>NO READING</span>"
+"<span id='magZ' class='inputValue zValue'>Current Z: NO READING</span>"
+"<span id='magBase' class='inputValue baseValue'>Baseline: 15 uT</span>"
+"<button id='calMagBtn' class='btn calBtn'>Calibrate</button>"
+"</div>"
+
+"<div class='inputItem'>"
+"<span class='inputName'>IR Count Rate</span>"
+"<span id='ir' class='inputValue irValue'>NO READING</span>"
+"</div>"
+
+"<div class='inputItem'>"
+"<span class='inputName'>Ultrasonic 40kHz</span>"
+"<span id='ultra' class='inputValue ultraValue'>NO READING</span>"
+"</div>"
+
+"<div class='inputItem'>"
+"<span class='inputName'>Radio Age</span>"
+"<span id='radioAge' class='inputValue radioValue'>NO READING</span>"
+"</div>"
+
+"</div></section>"
+"</div></main>"
+  ));
+
+  sendChunk(client, F(
+"<script>"
+"var keys={up:false,down:false,left:false,right:false};"
+"var activeCmd='stop';"
+"var lastSentCmd='stop';"
+"var keepAliveTimer=null;"
+"var commandSeq=0;"
+"var currentSeq=0;"
+"function el(x){return document.getElementById(x)}"
+
+"function setState(t){"
+"var shown=t;"
+"if(t==='FWD')shown='FORWARD';"
+"else if(t==='BWD')shown='BACKWARD';"
+"else if(t==='L')shown='LEFT';"
+"else if(t==='R')shown='RIGHT';"
+"else if(t==='FL')shown='FORWARD + LEFT';"
+"else if(t==='FR')shown='FORWARD + RIGHT';"
+"else if(t==='BL')shown='BACKWARD + LEFT';"
+"else if(t==='BR')shown='BACKWARD + RIGHT';"
+"else if(t==='STALE')return;"
+"el('state').textContent=shown;"
+"}"
+
+"function clearActive(){['bf','bb','bl','br','bs'].forEach(function(id){el(id).classList.remove('active')})}"
+"function show(c){"
+"clearActive();"
+"function a(id){el(id).classList.add('active')}"
+"if(c==='forward')a('bf');"
+"else if(c==='backward')a('bb');"
+"else if(c==='left')a('bl');"
+"else if(c==='right')a('br');"
+"else if(c==='fwdleft'){a('bf');a('bl')}"
+"else if(c==='fwdright'){a('bf');a('br')}"
+"else if(c==='backleft'){a('bb');a('bl')}"
+"else if(c==='backright'){a('bb');a('br')}"
+"else a('bs');"
+"}"
+  ));
+
+  sendChunk(client, F(
+"function request(path,callback){"
+"var x=new XMLHttpRequest();"
+"x.onreadystatechange=function(){if(this.readyState===4&&this.status===200&&callback)callback(this.responseText)};"
+"var sep=(path.indexOf('?')>=0)?'&':'?';"
+"x.open('GET',path+sep+'t='+Date.now(),true);"
+"x.send();"
+"}"
+
+"function sendMove(c){"
+"if(c===lastSentCmd){show(c);return;}"
+"lastSentCmd=c;"
+"commandSeq++;"
+"currentSeq=commandSeq;"
+"request('/'+c+'?seq='+currentSeq,function(r){setState(r)});"
+"show(c);"
+"}"
+
+"function sendKeepAlive(){if(activeCmd!=='stop'){request('/keepalive?seq='+currentSeq,null)}}"
+"function startKeepAlive(){if(keepAliveTimer)clearInterval(keepAliveTimer);keepAliveTimer=setInterval(sendKeepAlive,200)}"
+"function stopKeepAlive(){if(keepAliveTimer){clearInterval(keepAliveTimer);keepAliveTimer=null}}"
+
+"function startHold(c){if(activeCmd!==c){activeCmd=c;sendMove(c)}startKeepAlive()}"
+"function stopHold(){stopKeepAlive();if(activeCmd!=='stop'){activeCmd='stop';sendMove('stop')}else{show('stop')}}"
+  ));
+
+  sendChunk(client, F(
+"function updateSpeedDisplay(v){"
+"var t='MAX';"
+"if(v==0)t='MIN';"
+"else if(v==1)t='MID';"
+"el('speedStatus').textContent=t;"
+"}"
+
+"function sendSpeed(v){"
+"updateSpeedDisplay(v);"
+"request('/speed?level='+v,null);"
+"}"
+
+"function updateInputs(){"
+"request('/inputs',function(r){"
+"var v=r.split('|');"
+"if(v.length>=6){"
+"el('mag').textContent=v[0];"
+"el('magZ').textContent='Current Z: '+v[1];"
+"el('magBase').textContent='Baseline: '+v[2]+' uT';"
+"el('ir').textContent=v[3];"
+"el('ultra').textContent=v[4];"
+"el('radioAge').textContent=v[5];"
+"}"
+"});"
+"}"
+
+"function calibrateMag(){"
+"request('/calibratemag',function(r){"
+"el('magBase').textContent='Baseline: '+r+' uT';"
+"updateInputs();"
+"});"
+"}"
+  ));
+
+  sendChunk(client, F(
+"function calcKeys(){"
+"var u=keys.up&&!keys.down;"
+"var d=keys.down&&!keys.up;"
+"var l=keys.left&&!keys.right;"
+"var r=keys.right&&!keys.left;"
+"if(u){if(l)return'fwdleft';if(r)return'fwdright';return'forward'}"
+"if(d){if(l)return'backleft';if(r)return'backright';return'backward'}"
+"if(l)return'left';"
+"if(r)return'right';"
+"return'stop';"
+"}"
+
+"function updateKeys(){"
+"var c=calcKeys();"
+"if(c==='stop'){stopHold();return;}"
+"if(c!==activeCmd)startHold(c);"
+"}"
+
+"function setKey(e,v){"
+"var used=true;"
+"if(e.key==='ArrowUp')keys.up=v;"
+"else if(e.key==='ArrowDown')keys.down=v;"
+"else if(e.key==='ArrowLeft')keys.left=v;"
+"else if(e.key==='ArrowRight')keys.right=v;"
+"else used=false;"
+"if(used){e.preventDefault();updateKeys()}"
+"}"
+
+"function attachHold(id,cmd){"
+"var b=el(id);"
+"b.addEventListener('mousedown',function(e){e.preventDefault();if(cmd==='stop')stopHold();else startHold(cmd)});"
+"b.addEventListener('mouseup',function(e){e.preventDefault();stopHold()});"
+"b.addEventListener('mouseleave',function(){if(activeCmd===cmd)stopHold()});"
+"b.addEventListener('touchstart',function(e){e.preventDefault();if(cmd==='stop')stopHold();else startHold(cmd)},{passive:false});"
+"b.addEventListener('touchend',function(e){e.preventDefault();stopHold()},{passive:false});"
+"b.addEventListener('touchcancel',function(e){e.preventDefault();stopHold()},{passive:false});"
+"}"
+  ));
+
+  sendChunk(client, F(
+"attachHold('bf','forward');"
+"attachHold('bb','backward');"
+"attachHold('bl','left');"
+"attachHold('br','right');"
+"attachHold('bs','stop');"
+"document.addEventListener('keydown',function(e){if(!e.repeat)setKey(e,true)});"
+"document.addEventListener('keyup',function(e){setKey(e,false)});"
+"el('speedSlider').addEventListener('input',function(){sendSpeed(this.value)});"
+"el('calMagBtn').addEventListener('click',function(e){e.preventDefault();calibrateMag()});"
+"window.addEventListener('blur',stopHold);"
+"document.addEventListener('visibilitychange',function(){if(document.hidden)stopHold()});"
+"var SENSOR_UPDATE_MS=1500;"
+"show('stop');"
+"updateSpeedDisplay(el('speedSlider').value);"
+"updateInputs();"
+"setInterval(updateInputs,SENSOR_UPDATE_MS);"
+"</script>"
+"</body></html>"
+  ));
+}
+
+// ---------------- REQUEST HANDLING ----------------
+
+void handleRequest(String requestLine, WiFiClient &client) {
+  if (requestLine.startsWith("GET / ") || requestLine.startsWith("GET /?")) {
+    sendWebpage(client);
+  }
+  else if (requestLine.startsWith("GET /forward")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+    driveForward();
+    sendText(client, "FWD");
+  }
+  else if (requestLine.startsWith("GET /backward")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveBackward();
+    sendText(client, "BWD");
+  }
+  else if (requestLine.startsWith("GET /left")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveLeft();
+    sendText(client, "L");
+  }
+  else if (requestLine.startsWith("GET /right")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveRight();
+    sendText(client, "R");
+  }
+  else if (requestLine.startsWith("GET /fwdleft")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveForwardLeft();
+    sendText(client, "FL");
+  }
+  else if (requestLine.startsWith("GET /fwdright")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveForwardRight();
+    sendText(client, "FR");
+  }
+  else if (requestLine.startsWith("GET /backleft")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveBackLeft();
+    sendText(client, "BL");
+  }
+  else if (requestLine.startsWith("GET /backright")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    driveBackRight();
+    sendText(client, "BR");
+  }
+  else if (requestLine.startsWith("GET /stop")) {
+    if (!acceptMovementCommand(requestLine)) {
+      sendText(client, "STALE");
+      return;
+    }
+
+    stopMotors();
+    sendText(client, "STOP");
+  }
+  else if (requestLine.startsWith("GET /keepalive")) {
+    if (acceptKeepAlive(requestLine)) {
+      refreshMotorTimeout();
+      sendText(client, "K");
+    }
+    else {
+      sendText(client, "K_OLD");
+    }
+  }
+  else if (requestLine.startsWith("GET /speed?level=0")) {
+    speedMode = 0;
+    sendText(client, "MIN");
+  }
+  else if (requestLine.startsWith("GET /speed?level=1")) {
+    speedMode = 1;
+    sendText(client, "MID");
+  }
+  else if (requestLine.startsWith("GET /speed?level=2")) {
+    speedMode = 2;
+    sendText(client, "MAX");
+  }
+  else if (requestLine.startsWith("GET /calibratemag")) {
+    calibrateMagneticBaseline();
+
+    String message = String(magneticBaselineZ);
+    sendText(client, message.c_str());
+  }
+  else if (requestLine.startsWith("GET /inputs")) {
+    sBmm150MagData_t magData = getMagneticData();
+    String magDirection = getMagneticDirection(magData.z);
+
+    String magZText;
+    if (!bmmReady) {
+      magZText = "NO READING";
+    }
+    else {
+      magZText = String(magData.z);
+      magZText += " uT";
+    }
+
+    String irText;
+    if (irPulseRate == 0) {
+      irText = "NO READING";
+    }
+    else {
+      irText = String(irPulseRate);
+      irText += " pulses/sec";
+    }
+
+    String ultrasonicText;
+    if (ultrasonicDetected) {
+      ultrasonicText = "40kHz DETECTED";
+    }
+    else {
+      ultrasonicText = "NO READING";
+    }
+
+    String message = magDirection;
+    message += "|";
+    message += magZText;
+    message += "|";
+    message += String(magneticBaselineZ);
+    message += "|";
+    message += irText;
+    message += "|";
+    message += ultrasonicText;
+    message += "|";
+    message += currentRadioAge;
+
+    sendText(client, message.c_str());
+  }
+  else if (requestLine.startsWith("GET /favicon.ico")) {
+    sendNotFound(client);
+  }
+  else {
+    sendNotFound(client);
+  }
+}
+
+// ---------------- SETUP ----------------
+
+void setup() {
+  pinMode(RIGHT_DIR, OUTPUT);
+  pinMode(RIGHT_EN, OUTPUT);
+  pinMode(LEFT_DIR, OUTPUT);
+  pinMode(LEFT_EN, OUTPUT);
+
+  pinMode(IR_INPUT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(IR_INPUT_PIN), pulseISR, RISING);
+
+  pinMode(ULTRASONIC_INPUT_PIN, INPUT);
+
+  pinMode(RADIO_INPUT_PIN, INPUT_PULLUP);
+
+  stopMotors();
+
+  Serial.begin(9600);
+
+  while (!Serial && millis() < 10000);
+
+  Serial.println(F("\nStarting EEE Rover Web Server"));
+
+  Wire.begin();
+
+  Serial.println(F("Attempting BMM150 connection"));
+
+  if (bmm150.begin()) {
+    bmmReady = false;
+    Serial.println(F("BMM150 init failed"));
+    Serial.println(F("Magnetic sensor: NO READING"));
+  }
+  else {
+    bmmReady = true;
+    Serial.println(F("BMM150 init success"));
+    Serial.println(F("Magnetic sensor: READY"));
+
+    bmm150.setOperationMode(BMM150_POWERMODE_NORMAL);
+    delay(50);
+    bmm150.setPresetMode(BMM150_PRESETMODE_HIGHACCURACY);
+    bmm150.setRate(BMM150_DATA_RATE_10HZ);
+    bmm150.setMeasurementXYZ();
+  }
+
+  if (WiFi.status() == WL_NO_SHIELD) {
+    Serial.println(F("WiFi shield not present"));
+    while (true);
+  }
+
+  if (groupNumber) {
+    WiFi.config(IPAddress(192, 168, 0, groupNumber + 1));
+  }
+
+  Serial.print(F("Connecting to WPA SSID: "));
+  Serial.println(ssid);
+
+  while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+
+  Serial.println();
+  Serial.println(F("WiFi connected"));
+
+  server.begin();
+
+  IPAddress ip = WiFi.localIP();
+
+  Serial.print(F("HTTP server started @ "));
+  Serial.print(ip[0]);
+  Serial.print(F("."));
+  Serial.print(ip[1]);
+  Serial.print(F("."));
+  Serial.print(ip[2]);
+  Serial.print(F("."));
+  Serial.println(ip[3]);
+}
+
+// ---------------- LOOP ----------------
+
+void loop() {
+  updateIRPulseRate();
+  updateUltrasonicSensor();
+  updateRadioSensor();
+
+  if (motorsAreRunning && (millis() - lastMotorCommandTime > MOTOR_TIMEOUT_MS)) {
+    stopMotors();
+  }
+
+  WiFiClient client = server.available();
+
+  if (client) {
+    unsigned long timeout = millis() + 1000;
+
+    while (client.connected() && !client.available() && millis() < timeout) {
+      delay(1);
+    }
+
+    if (client.available()) {
+      String requestLine = client.readStringUntil('\r');
+      client.readStringUntil('\n');
+
+      while (client.available()) {
+        String headerLine = client.readStringUntil('\n');
+        if (headerLine == "\r" || headerLine.length() <= 1) {
+          break;
+        }
+      }
+
+      handleRequest(requestLine, client);
+    }
+
+    delay(1);
+    client.stop();
+  }
+}
