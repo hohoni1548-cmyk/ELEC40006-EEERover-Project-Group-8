@@ -22,7 +22,6 @@
 
   Webpage displays:
     - Rover controls
-    - Rover state
     - Speed setting
     - Magnetic field direction
     - Magnetic Z value
