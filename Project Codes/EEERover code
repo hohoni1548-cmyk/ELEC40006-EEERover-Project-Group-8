@@ -1,4 +1,4 @@
-/**************************************************************************************************************************************
+/**********************************************
   EEERover Web Control 
 
   MOTOR WIRING USED 
@@ -25,13 +25,14 @@
     - Rover state
     - Speed setting
     - Magnetic field direction
-    - Current magnetic Z value
+    - Magnetic Z value
     - Magnetic baseline value
     - Magnetic calibrate button
     - IR count rate
     - Ultrasonic 40kHz detection
-    - Current radio age
- ***************************************************************************************************************************************/
+    - Radio age
+    - Rock type
+ *********************************************/
 
 #include <SPI.h>
 #include <Wire.h>
@@ -52,6 +53,7 @@ DFRobot_BMM150_I2C bmm150(&Wire, I2C_ADDRESS_4);
 bool bmmReady = false;
 
 float magneticBaselineZ = 15.0;
+String lastValidMagneticDirection = "NO READING";
 
 // ---------------- INFRARED SENSOR ----------------
 
@@ -61,19 +63,43 @@ volatile unsigned long pulseCount = 0;
 unsigned long irPulseRate = 0;
 unsigned long lastIRSampleTime = 0;
 
+const unsigned long IR_TOLERANCE = 90;
+
+int lastValidIRApprox = 0;
+
 void pulseISR() {
   pulseCount++;
 }
 
+void updateLastValidIR() {
+  if (irPulseRate >= 547 - IR_TOLERANCE && irPulseRate <= 547 + IR_TOLERANCE) {
+    lastValidIRApprox = 547;
+  }
+  else if (irPulseRate >= 312 - IR_TOLERANCE && irPulseRate <= 312 + IR_TOLERANCE) {
+    lastValidIRApprox = 312;
+  }
+}
+
+String getLastValidIRText() {
+  if (lastValidIRApprox == 547) {
+    return "547 pulses/sec";
+  }
+  else if (lastValidIRApprox == 312) {
+    return "312 pulses/sec";
+  }
+
+  return "NO READING";
+}
+
 void updateIRPulseRate() {
-  if (millis() - lastIRSampleTime >= 1000)
-  {
+  if (millis() - lastIRSampleTime >= 1000) {
     noInterrupts();
     unsigned long count = pulseCount;
     pulseCount = 0;
     interrupts();
 
     irPulseRate = count;
+    updateLastValidIR();
     lastIRSampleTime = millis();
   }
 }
@@ -83,9 +109,19 @@ void updateIRPulseRate() {
 const int ULTRASONIC_INPUT_PIN = A0;
 
 bool ultrasonicDetected = false;
+bool HasUltraSound = false;
 
 void updateUltrasonicSensor() {
   ultrasonicDetected = (digitalRead(ULTRASONIC_INPUT_PIN) == HIGH);
+  HasUltraSound = ultrasonicDetected;
+}
+
+String getLastValidUltrasonicText() {
+  if (HasUltraSound) {
+    return "40kHz DETECTED";
+  }
+
+  return "NO 40kHz";
 }
 
 // ---------------- RADIO SENSOR ----------------
@@ -132,19 +168,12 @@ void processRadioChar(char data) {
 
   if (data == '#') {
     if (radioBuffer.length() == 3) {
-      String newAge = "";
-      newAge += radioBuffer[0];
-      newAge += ".";
-      newAge += radioBuffer[1];
-      newAge += radioBuffer[2];
-      newAge += " billion years";
-
-      currentRadioAge = newAge;
-    }
+      currentRadioAge = radioBuffer.substring(0, 1) + "." + radioBuffer.substring(1, 3) + " billion years";
+}
+ }
 
     radioBuffer = "";
-  }
-  else if (isDigit(data)) {
+  if (isDigit(data)) {
     if (radioBuffer.length() < 3) {
       radioBuffer += data;
     }
@@ -292,6 +321,28 @@ String getMagneticDirection(float zValue) {
   }
 
   return "NO READING";
+}
+
+void updateLastValidMagnetic(String direction) {
+  if (direction == "UP" || direction == "DOWN") {
+    lastValidMagneticDirection = direction;
+  }
+}
+
+String getLastValidMagneticText() {
+  return lastValidMagneticDirection;
+}
+
+String getRockType() {
+  if (lastValidMagneticDirection == "DOWN") {
+    if (lastValidIRApprox == 547 && HasUltraSound) return "Basaltoid";
+    if (lastValidIRApprox == 312 && !HasUltraSound) return "Gravion";
+  } 
+  else if (lastValidMagneticDirection == "UP") {
+    if (lastValidIRApprox == 312 && HasUltraSound) return "Regolix";
+    if (lastValidIRApprox == 547 && !HasUltraSound) return "Lunarite";
+  }
+  return "UNKNOWN ROCK";
 }
 
 void calibrateMagneticBaseline() {
@@ -466,6 +517,8 @@ void sendWebpage(WiFiClient &client) {
 ".irValue{color:#facc15}"
 ".ultraValue{color:#22d3ee}"
 ".radioValue{color:#fb923c}"
+".rockValue{color:#f472b6}"
+".lastValue{color:#a5b4fc;font-size:18px;line-height:1.35}"
 ".calBtn{margin-top:12px;min-height:50px;background:#7c3aed;width:100%}"
 "@media(max-width:850px){body{align-items:flex-start}.layout{grid-template-columns:1fr}.card{width:96vw}h1{font-size:34px}}"
 "</style></head>"
@@ -518,6 +571,7 @@ void sendWebpage(WiFiClient &client) {
 "<div class='inputItem'>"
 "<span class='inputName'>IR Count Rate</span>"
 "<span id='ir' class='inputValue irValue'>NO READING</span>"
+"<span id='lastIR' class='inputValue lastValue'>Last valid IR: NO READING</span>"
 "</div>"
 
 "<div class='inputItem'>"
@@ -528,6 +582,12 @@ void sendWebpage(WiFiClient &client) {
 "<div class='inputItem'>"
 "<span class='inputName'>Radio Age</span>"
 "<span id='radioAge' class='inputValue radioValue'>NO READING</span>"
+"</div>"
+
+
+"<div class='inputItem'>"
+"<span class='inputName'>Detected Rock Type</span>"
+"<span id='rockType' class='inputValue rockValue'>NO ROCK MATCH</span>"
 "</div>"
 
 "</div></section>"
@@ -616,13 +676,15 @@ void sendWebpage(WiFiClient &client) {
 "function updateInputs(){"
 "request('/inputs',function(r){"
 "var v=r.split('|');"
-"if(v.length>=6){"
+"if(v.length>=10){"
 "el('mag').textContent=v[0];"
 "el('magZ').textContent='Current Z: '+v[1];"
 "el('magBase').textContent='Baseline: '+v[2]+' uT';"
 "el('ir').textContent=v[3];"
 "el('ultra').textContent=v[4];"
 "el('radioAge').textContent=v[5];"
+"el('lastIR').textContent='Last valid IR: '+v[6];"
+"el('rockType').textContent=v[9];"
 "}"
 "});"
 "}"
@@ -813,6 +875,7 @@ void handleRequest(String requestLine, WiFiClient &client) {
   else if (requestLine.startsWith("GET /inputs")) {
     sBmm150MagData_t magData = getMagneticData();
     String magDirection = getMagneticDirection(magData.z);
+    updateLastValidMagnetic(magDirection);
 
     String magZText;
     if (!bmmReady) {
@@ -851,6 +914,14 @@ void handleRequest(String requestLine, WiFiClient &client) {
     message += ultrasonicText;
     message += "|";
     message += currentRadioAge;
+    message += "|";
+    message += getLastValidIRText();
+    message += "|";
+    message += getLastValidUltrasonicText();
+    message += "|";
+    message += getLastValidMagneticText();
+    message += "|";
+    message += getRockType();
 
     sendText(client, message.c_str());
   }
